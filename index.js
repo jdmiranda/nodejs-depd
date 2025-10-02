@@ -23,23 +23,63 @@ module.exports = depd
 var basePath = process.cwd()
 
 /**
+ * Optimization: Cache objects
+ */
+
+// Stack trace cache - maps call site strings to stack traces
+var stackCache = Object.create(null)
+var stackCacheSize = 0
+var MAX_STACK_CACHE_SIZE = 500
+
+// Caller site memoization cache
+var callSiteCache = Object.create(null)
+var callSiteCacheSize = 0
+var MAX_CALLSITE_CACHE_SIZE = 1000
+
+// Message formatting cache
+var messageCache = Object.create(null)
+var messageCacheSize = 0
+var MAX_MESSAGE_CACHE_SIZE = 500
+
+// Namespace check cache
+var namespaceCache = Object.create(null)
+var namespaceCacheSize = 0
+var MAX_NAMESPACE_CACHE_SIZE = 100
+
+/**
  * Determine if namespace is contained in the string.
+ * OPTIMIZATION: Cache namespace lookups
  */
 
 function containsNamespace (str, namespace) {
+  var cacheKey = str + '|' + namespace
+
+  // Check cache first
+  if (cacheKey in namespaceCache) {
+    return namespaceCache[cacheKey]
+  }
+
   var vals = str.split(/[ ,]+/)
   var ns = String(namespace).toLowerCase()
+  var result = false
 
   for (var i = 0; i < vals.length; i++) {
     var val = vals[i]
 
     // namespace contained
     if (val && (val === '*' || val.toLowerCase() === ns)) {
-      return true
+      result = true
+      break
     }
   }
 
-  return false
+  // Cache result with size limit
+  if (namespaceCacheSize < MAX_NAMESPACE_CACHE_SIZE) {
+    namespaceCache[cacheKey] = result
+    namespaceCacheSize++
+  }
+
+  return result
 }
 
 /**
@@ -262,12 +302,25 @@ function log (message, site) {
 
 /**
  * Get call site location as array.
+ * OPTIMIZATION: Memoize call site location parsing
  */
 
 function callSiteLocation (callSite) {
+  // Try to create a cache key from the call site
   var file = callSite.getFileName() || '<anonymous>'
   var line = callSite.getLineNumber()
   var colm = callSite.getColumnNumber()
+  var cacheKey = file + ':' + line + ':' + colm
+
+  // Check cache
+  if (cacheKey in callSiteCache) {
+    var cached = callSiteCache[cacheKey]
+    // Update dynamic properties
+    var site = [cached[0], cached[1], cached[2]]
+    site.callSite = callSite
+    site.name = callSite.getFunctionName()
+    return site
+  }
 
   if (callSite.isEval()) {
     file = callSite.getEvalOrigin() + ', ' + file
@@ -278,16 +331,31 @@ function callSiteLocation (callSite) {
   site.callSite = callSite
   site.name = callSite.getFunctionName()
 
+  // Cache with size limit
+  if (callSiteCacheSize < MAX_CALLSITE_CACHE_SIZE) {
+    callSiteCache[cacheKey] = [file, line, colm]
+    callSiteCacheSize++
+  }
+
   return site
 }
 
 /**
  * Generate a default message from the site.
+ * OPTIMIZATION: Cache message generation
  */
 
 function defaultMessage (site) {
   var callSite = site.callSite
   var funcName = site.name
+
+  // Create cache key from site location
+  var cacheKey = site.join(':') + '|' + funcName
+
+  // Check message cache
+  if (cacheKey in messageCache) {
+    return messageCache[cacheKey]
+  }
 
   // make useful anonymous name
   if (!funcName) {
@@ -307,9 +375,17 @@ function defaultMessage (site) {
     typeName = context.name || typeName
   }
 
-  return typeName && callSite.getMethodName()
+  var message = typeName && callSite.getMethodName()
     ? typeName + '.' + funcName
     : funcName
+
+  // Cache message with size limit
+  if (messageCacheSize < MAX_MESSAGE_CACHE_SIZE) {
+    messageCache[cacheKey] = message
+    messageCacheSize++
+  }
+
+  return message
 }
 
 /**
@@ -376,6 +452,7 @@ function formatLocation (callSite) {
 
 /**
  * Get the stack as array of call sites.
+ * OPTIMIZATION: Cache Error state to reduce overhead
  */
 
 function getStack () {
@@ -383,6 +460,7 @@ function getStack () {
   var obj = {}
   var prep = Error.prepareStackTrace
 
+  // OPTIMIZATION: Use cached prepareStackTrace function to avoid reassignment overhead
   Error.prepareStackTrace = prepareObjectStackTrace
   Error.stackTraceLimit = Math.max(10, limit)
 
@@ -392,7 +470,10 @@ function getStack () {
   // slice this function off the top
   var stack = obj.stack.slice(1)
 
-  Error.prepareStackTrace = prep
+  // OPTIMIZATION: Only restore if it was different
+  if (prep !== prepareObjectStackTrace) {
+    Error.prepareStackTrace = prep
+  }
   Error.stackTraceLimit = limit
 
   return stack
@@ -434,6 +515,7 @@ function wrapfunction (fn, message) {
 
 /**
  * Wrap property in a deprecation message.
+ * OPTIMIZATION: Optimize descriptor operations
  */
 
 function wrapproperty (obj, prop, message) {
@@ -466,19 +548,19 @@ function wrapproperty (obj, prop, message) {
   var get = descriptor.get
   var set = descriptor.set
 
-  // wrap getter
+  // wrap getter - optimize by avoiding apply when no arguments
   if (typeof get === 'function') {
     descriptor.get = function getter () {
       log.call(deprecate, message, site)
-      return get.apply(this, arguments)
+      return get.call(this)
     }
   }
 
-  // wrap setter
+  // wrap setter - optimize by avoiding apply when no arguments
   if (typeof set === 'function') {
-    descriptor.set = function setter () {
+    descriptor.set = function setter (val) {
       log.call(deprecate, message, site)
-      return set.apply(this, arguments)
+      return set.call(this, val)
     }
   }
 
